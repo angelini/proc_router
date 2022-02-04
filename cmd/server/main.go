@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,58 +14,45 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"sync"
 	"syscall"
+	"time"
 
 	"go.uber.org/zap"
 )
 
-const (
-	portStart = 30000
-)
-
-var portOffset = 0
-
 type cliArgs struct {
 	port   int
+	host   string
 	script string
 }
 
 func parseArgs() *cliArgs {
 	port := flag.Int("port", 5251, "Server's port (default: 5251)")
+	host := flag.String("host", "127.0.0.1", "Script server hostname")
 	script := flag.String("script", "", "Script to execute")
 
 	flag.Parse()
 
 	return &cliArgs{
 		port:   *port,
+		host:   *host,
 		script: *script,
 	}
 }
 
-type VM struct {
-	executable string
+type Process struct {
+	log        *zap.Logger
+	port       int
+	version    int
+	cmd        *exec.Cmd
+	cancelFunc context.CancelFunc
 }
 
-type Proc struct {
-	port int
-	cmd  *exec.Cmd
-}
+func (p *Process) Run(parentCtx context.Context) error {
+	ctx, cancel := context.WithCancel(parentCtx)
+	p.cancelFunc = cancel
 
-func NewProc(ctx context.Context, vm *VM, script string) *Proc {
-	portOffset += 1
-	port := portStart + portOffset
-	cmd := exec.CommandContext(ctx, vm.executable, script)
-	cmd.Env = append(os.Environ(),
-		fmt.Sprintf("PR_PORT=%d", port),
-	)
-
-	return &Proc{
-		port: port,
-		cmd:  cmd,
-	}
-}
-
-func (p *Proc) Run(log *zap.Logger) error {
 	stdoutPipe, err := p.cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("failed to pipe stdout: %w", err)
@@ -82,11 +70,11 @@ func (p *Proc) Run(log *zap.Logger) error {
 			for {
 				line, _, err := reader.ReadLine()
 				if err == io.EOF {
-					log.Info("stdout EOF", zap.Int("port", p.port))
+					p.log.Info("stdout EOF", zap.Int("port", p.port))
 					break
 				}
 				if err != nil {
-					log.Error("failed to read stdout line", zap.Error(err))
+					p.log.Error("failed to read stdout line", zap.Error(err))
 					return
 				}
 				stdout <- string(line)
@@ -99,11 +87,11 @@ func (p *Proc) Run(log *zap.Logger) error {
 			for {
 				line, _, err := reader.ReadLine()
 				if err == io.EOF {
-					log.Info("stderr EOF", zap.Int("port", p.port))
+					p.log.Info("stderr EOF", zap.Int("port", p.port))
 					break
 				}
 				if err != nil {
-					log.Error("failed to read stderr line", zap.Error(err))
+					p.log.Error("failed to read stderr line", zap.Error(err))
 					return
 				}
 				stdout <- string(line)
@@ -112,24 +100,167 @@ func (p *Proc) Run(log *zap.Logger) error {
 
 		for {
 			select {
+			case <-ctx.Done():
+				return
 			case msg := <-stdout:
-				log.Info("stdout", zap.String("msg", msg), zap.Int("port", p.port))
+				p.log.Info("stdout", zap.String("msg", msg), zap.Int("port", p.port))
 			case msg := <-stderr:
-				log.Info("stderr", zap.String("msg", msg), zap.Int("port", p.port))
+				p.log.Info("stderr", zap.String("msg", msg), zap.Int("port", p.port))
 			}
 		}
 	}()
 
-	log.Info("start proc", zap.Int("port", p.port))
+	p.log.Info("start proc", zap.Int("port", p.port))
 	return p.cmd.Start()
 }
 
-func (p *Proc) Kill() error {
+func (p *Process) Kill() error {
 	if p.cmd.Process == nil {
 		return errors.New("cannot kill process that wasn't started")
 	}
 
-	return syscall.Kill(p.cmd.Process.Pid, syscall.SIGINT)
+	err := syscall.Kill(p.cmd.Process.Pid, syscall.SIGINT)
+	if err != nil {
+		return err
+	}
+
+	p.cancelFunc()
+	return nil
+}
+
+type Manager struct {
+	log        *zap.Logger
+	host       string
+	executable string
+	script     string
+	portStart  int
+	portOffset int
+	cancelFunc context.CancelFunc
+
+	procMutex sync.Mutex
+	current   *Process
+	next      *Process
+}
+
+func NewManager(parentCtx context.Context, log *zap.Logger, host, executable, script string, portStart int) *Manager {
+	ctx, cancel := context.WithCancel(parentCtx)
+
+	manager := &Manager{
+		log:        log,
+		host:       host,
+		executable: executable,
+		script:     script,
+		portStart:  portStart,
+		cancelFunc: cancel,
+	}
+
+	go func() {
+		client := &http.Client{}
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				next := manager.GetNext()
+				if next == nil {
+					time.Sleep(500 * time.Millisecond)
+					continue
+				}
+
+				url := fmt.Sprintf("http://%s:%d/", host, next.port)
+				resp, err := client.Get(url)
+				if err != nil {
+					log.Info("could not connect", zap.String("url", url))
+					time.Sleep(500 * time.Millisecond)
+					continue
+				}
+
+				if resp.StatusCode == http.StatusOK {
+					log.Info("successful connection, upgrading to current", zap.String("url", url))
+					manager.SetCurrent(next)
+				}
+			}
+		}
+	}()
+
+	return manager
+}
+
+func (m *Manager) Close() {
+	m.cancelFunc()
+}
+
+func (m *Manager) GetNext() *Process {
+	m.procMutex.Lock()
+	defer m.procMutex.Unlock()
+
+	return m.next
+}
+
+func (m *Manager) GetCurrent() *Process {
+	m.procMutex.Lock()
+	defer m.procMutex.Unlock()
+
+	return m.current
+}
+
+func (m *Manager) KillNextIfRunning() {
+	m.procMutex.Lock()
+	defer m.procMutex.Unlock()
+
+	if m.next != nil {
+		m.next.Kill()
+		m.next = nil
+	}
+}
+
+func (m *Manager) SetNext(proc *Process) {
+	m.procMutex.Lock()
+	defer m.procMutex.Unlock()
+
+	m.next = proc
+}
+
+func (m *Manager) SetCurrent(proc *Process) {
+	m.procMutex.Lock()
+	defer m.procMutex.Unlock()
+
+	if m.next == proc {
+		if m.current != nil {
+			m.current.Kill()
+		}
+
+		m.current = m.next
+		m.next = nil
+	}
+}
+
+func (m *Manager) StartProcess(ctx context.Context, version int) error {
+	m.KillNextIfRunning()
+
+	m.portOffset += 1
+	port := m.portStart + m.portOffset
+	cmd := exec.CommandContext(ctx, m.executable, m.script)
+	cmd.Env = append(os.Environ(),
+		fmt.Sprintf("PR_PORT=%d", port),
+		fmt.Sprintf("PR_VERSION=%d", version),
+	)
+
+	proc := &Process{
+		log:     m.log,
+		port:    port,
+		version: version,
+		cmd:     cmd,
+	}
+
+	err := proc.Run(ctx)
+	if err != nil {
+		return err
+	}
+
+	m.SetNext(proc)
+	return nil
 }
 
 func copyHeader(dest, src http.Header) {
@@ -140,6 +271,15 @@ func copyHeader(dest, src http.Header) {
 	}
 }
 
+type VersionRequest struct {
+	Version int
+}
+
+func httpErr(log *zap.Logger, resp http.ResponseWriter, err error, message string) {
+	log.Error(message, zap.Error(err))
+	http.Error(resp, err.Error(), http.StatusInternalServerError)
+}
+
 func main() {
 	ctx := context.Background()
 	log, err := zap.NewDevelopment()
@@ -148,30 +288,52 @@ func main() {
 	}
 
 	args := parseArgs()
-	vm := &VM{executable: "node"}
-	proc := NewProc(ctx, vm, args.script)
+	client := &http.Client{}
 
-	err = proc.Run(log)
+	manager := NewManager(ctx, log, args.host, "node", args.script, 30000)
+	defer manager.Close()
+
+	err = manager.StartProcess(ctx, 1)
 	if err != nil {
 		log.Fatal("cannot start proc", zap.Error(err))
 	}
 
-	client := &http.Client{}
+	http.HandleFunc("/__meta/version", func(resp http.ResponseWriter, req *http.Request) {
+		var versionReq VersionRequest
+
+		err := json.NewDecoder(req.Body).Decode(&versionReq)
+		if err != nil {
+			httpErr(log, resp, err, "failed to read proxy request body")
+			return
+		}
+
+		err = manager.StartProcess(ctx, versionReq.Version)
+		if err != nil {
+			httpErr(log, resp, err, "failed to start process")
+			return
+		}
+
+		fmt.Fprintf(resp, "Version: %d", versionReq.Version)
+	})
 
 	http.HandleFunc("/", func(resp http.ResponseWriter, req *http.Request) {
 		body, err := io.ReadAll(req.Body)
 		if err != nil {
-			log.Error("failed to read request body", zap.Error(err))
-			http.Error(resp, err.Error(), http.StatusInternalServerError)
+			httpErr(log, resp, err, "failed to read proxy request body")
 			return
 		}
 
-		url := fmt.Sprintf("http://127.0.0.1:%d/", proc.port)
+		current := manager.GetCurrent()
+		if current == nil {
+			http.Error(resp, "manager has no current process", http.StatusTooEarly)
+			return
+		}
+
+		url := fmt.Sprintf("http://%s:%d/", manager.host, current.port)
 
 		proxyReq, err := http.NewRequest(req.Method, url, bytes.NewReader(body))
 		if err != nil {
-			log.Error("failed to create proxy request", zap.Error(err))
-			http.Error(resp, err.Error(), http.StatusInternalServerError)
+			httpErr(log, resp, err, "failed to create proxy request")
 			return
 		}
 
@@ -180,8 +342,7 @@ func main() {
 
 		proxyResp, err := client.Do(proxyReq)
 		if err != nil {
-			log.Error("failed to proxy request", zap.Error(err))
-			http.Error(resp, err.Error(), http.StatusInternalServerError)
+			httpErr(log, resp, err, "failed to proxy request")
 			return
 		}
 		defer proxyResp.Body.Close()

@@ -7,7 +7,7 @@ const server = http.createServer((req, res) => {
   console.log(`req logging from ${process.env.PR_PORT}`);
   res.statusCode = 200;
   res.setHeader('Content-Type', 'text/plain');
-  res.end(`hello from ${process.env.PR_PORT}`);
+  res.end(`hello from port: ${process.env.PR_PORT}, version: ${process.env.PR_VERSION}`);
 });
 
 server.listen(port, hostname, () => {
