@@ -137,7 +137,7 @@ type Manager struct {
 	portOffset int
 	cancelFunc context.CancelFunc
 
-	procMutex sync.Mutex
+	procMutex sync.RWMutex
 	current   *Process
 	next      *Process
 }
@@ -188,21 +188,25 @@ func NewManager(parentCtx context.Context, log *zap.Logger, host, executable, sc
 }
 
 func (m *Manager) Close() {
+	m.procMutex.Lock()
+	defer m.procMutex.Unlock()
+
+	if m.next != nil {
+		m.next.Kill()
+	}
+
+	if m.current != nil {
+		m.current.Kill()
+	}
+
 	m.cancelFunc()
 }
 
 func (m *Manager) GetNext() *Process {
-	m.procMutex.Lock()
-	defer m.procMutex.Unlock()
+	m.procMutex.RLock()
+	defer m.procMutex.RUnlock()
 
 	return m.next
-}
-
-func (m *Manager) GetCurrent() *Process {
-	m.procMutex.Lock()
-	defer m.procMutex.Unlock()
-
-	return m.current
 }
 
 func (m *Manager) KillNextIfRunning() {
@@ -263,6 +267,41 @@ func (m *Manager) StartProcess(ctx context.Context, version int) error {
 	return nil
 }
 
+func (m *Manager) sendLivePort(portChan chan int) bool {
+	m.procMutex.RLock()
+	defer m.procMutex.RUnlock()
+
+	if m.next == nil && m.current != nil {
+		portChan <- m.current.port
+		return true
+	}
+	return false
+}
+
+func (m *Manager) LivePortChannel(ctx context.Context) chan int {
+	portChan := make(chan int, 1)
+	foundPort := m.sendLivePort(portChan)
+
+	if !foundPort {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					if m.sendLivePort(portChan) {
+						return
+					} else {
+						time.Sleep(100 * time.Millisecond)
+					}
+				}
+			}
+		}()
+	}
+
+	return portChan
+}
+
 func copyHeader(dest, src http.Header) {
 	for key, value := range src {
 		for _, nested := range value {
@@ -293,11 +332,6 @@ func main() {
 	manager := NewManager(ctx, log, args.host, "node", args.script, 30000)
 	defer manager.Close()
 
-	err = manager.StartProcess(ctx, 1)
-	if err != nil {
-		log.Fatal("cannot start proc", zap.Error(err))
-	}
-
 	http.HandleFunc("/__meta/version", func(resp http.ResponseWriter, req *http.Request) {
 		var versionReq VersionRequest
 
@@ -317,38 +351,44 @@ func main() {
 	})
 
 	http.HandleFunc("/", func(resp http.ResponseWriter, req *http.Request) {
-		body, err := io.ReadAll(req.Body)
-		if err != nil {
-			httpErr(log, resp, err, "failed to read proxy request body")
-			return
+		reqCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		portChan := manager.LivePortChannel(reqCtx)
+
+		select {
+		case <-time.After(5 * time.Second):
+			http.Error(resp, "timeout waiting for live port", http.StatusGatewayTimeout)
+			log.Info("timeout waiting for live port", zap.String("url", req.URL.Path))
+
+		case port := <-portChan:
+			body, err := io.ReadAll(req.Body)
+			if err != nil {
+				httpErr(log, resp, err, "failed to read proxy request body")
+				return
+			}
+
+			url := fmt.Sprintf("http://%s:%d/", manager.host, port)
+
+			proxyReq, err := http.NewRequest(req.Method, url, bytes.NewReader(body))
+			if err != nil {
+				httpErr(log, resp, err, "failed to create proxy request")
+				return
+			}
+
+			proxyReq.Header = make(http.Header)
+			copyHeader(proxyReq.Header, req.Header)
+
+			proxyResp, err := client.Do(proxyReq)
+			if err != nil {
+				httpErr(log, resp, err, "failed to proxy request")
+				return
+			}
+			defer proxyResp.Body.Close()
+
+			copyHeader(resp.Header(), proxyResp.Header)
+			io.Copy(resp, proxyResp.Body)
 		}
-
-		current := manager.GetCurrent()
-		if current == nil {
-			http.Error(resp, "manager has no current process", http.StatusTooEarly)
-			return
-		}
-
-		url := fmt.Sprintf("http://%s:%d/", manager.host, current.port)
-
-		proxyReq, err := http.NewRequest(req.Method, url, bytes.NewReader(body))
-		if err != nil {
-			httpErr(log, resp, err, "failed to create proxy request")
-			return
-		}
-
-		proxyReq.Header = make(http.Header)
-		copyHeader(proxyReq.Header, req.Header)
-
-		proxyResp, err := client.Do(proxyReq)
-		if err != nil {
-			httpErr(log, resp, err, "failed to proxy request")
-			return
-		}
-		defer proxyResp.Body.Close()
-
-		copyHeader(resp.Header(), proxyResp.Header)
-		io.Copy(resp, proxyResp.Body)
 	})
 
 	log.Info("start routing server", zap.Int("port", args.port), zap.String("script", args.script))
