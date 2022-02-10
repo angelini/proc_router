@@ -13,6 +13,10 @@ import (
 	"go.uber.org/zap"
 )
 
+const (
+	PROXY_REQUEST_READ_TIMEOUT = 5 * time.Second
+)
+
 type VersionRequest struct {
 	Version int
 }
@@ -45,7 +49,7 @@ func StartServer(ctx context.Context, log *zap.Logger, manager *Manager, serverP
 		portChan := manager.LivePortChannel(reqCtx)
 
 		select {
-		case <-time.After(5 * time.Second):
+		case <-time.After(PROXY_REQUEST_READ_TIMEOUT):
 			http.Error(resp, "timeout waiting for live port", http.StatusGatewayTimeout)
 			log.Info("timeout waiting for live port", zap.String("url", req.URL.Path))
 

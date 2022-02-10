@@ -1,7 +1,9 @@
 Start server:
 
+(note: the server in `script.mjs` is purposefully slow to simulate longer response times)
+
 ```bash
-$ go run cmd/server/main.go -script script.js
+$ go run cmd/server/main.go -script script.mjs
 ```
 
 Run script with version 1:

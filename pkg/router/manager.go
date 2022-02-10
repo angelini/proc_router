@@ -12,6 +12,11 @@ import (
 	"go.uber.org/zap"
 )
 
+const (
+	NEXT_PROCESS_HEALTHY_INTERVAL = 500 * time.Millisecond
+	OLD_PROCESS_GRACEFUL_INTERVAL = 2 * time.Second
+)
+
 type Manager struct {
 	Host string
 
@@ -52,15 +57,15 @@ func NewManager(parentCtx context.Context, log *zap.Logger, host, executable, sc
 			default:
 				nextPort := manager.getNextPort()
 				if nextPort == -1 {
-					time.Sleep(500 * time.Millisecond)
+					time.Sleep(NEXT_PROCESS_HEALTHY_INTERVAL)
 					continue
 				}
 
-				url := fmt.Sprintf("http://%s:%d/", host, nextPort)
+				url := fmt.Sprintf("http://%s:%d/health", host, nextPort)
 				resp, err := client.Get(url)
 				if err != nil {
 					log.Info("could not connect", zap.String("url", url))
-					time.Sleep(500 * time.Millisecond)
+					time.Sleep(NEXT_PROCESS_HEALTHY_INTERVAL)
 					continue
 				}
 
@@ -84,6 +89,7 @@ func NewManager(parentCtx context.Context, log *zap.Logger, host, executable, sc
 						manager.removeGraceful(oldProc.port)
 					}
 				}
+				time.Sleep(OLD_PROCESS_GRACEFUL_INTERVAL)
 			}
 		}
 	}()
