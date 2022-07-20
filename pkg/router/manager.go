@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"os"
-	"os/exec"
 	"sync"
 	"time"
 
@@ -15,6 +13,9 @@ import (
 const (
 	NEXT_PROCESS_HEALTHY_INTERVAL = 500 * time.Millisecond
 	OLD_PROCESS_GRACEFUL_INTERVAL = 2 * time.Second
+	CHECK_LIVE_PORT_INTERVAL      = 100 * time.Millisecond
+
+	MAX_PORT_OFFSET = 500
 )
 
 type Manager struct {
@@ -192,19 +193,12 @@ func (m *Manager) StartProcess(ctx context.Context, version int) error {
 	}
 
 	m.portOffset += 1
-	port := m.portStart + m.portOffset
-	cmd := exec.CommandContext(ctx, m.executable, m.script)
-	cmd.Env = append(os.Environ(),
-		fmt.Sprintf("PR_PORT=%d", port),
-		fmt.Sprintf("PR_VERSION=%d", version),
-	)
-
-	proc := &Process{
-		log:     m.log,
-		port:    port,
-		version: version,
-		cmd:     cmd,
+	if m.portOffset > MAX_PORT_OFFSET {
+		m.portOffset = 0
 	}
+	port := m.portStart + m.portOffset
+
+	proc := NewProcess(m.log, m.executable, m.script, port, version)
 
 	err = proc.Run(ctx)
 	if err != nil {
@@ -258,7 +252,7 @@ func (m *Manager) LivePortChannel(ctx context.Context) chan int {
 					if m.sendLivePort(portChan) {
 						return
 					} else {
-						time.Sleep(100 * time.Millisecond)
+						time.Sleep(CHECK_LIVE_PORT_INTERVAL)
 					}
 				}
 			}

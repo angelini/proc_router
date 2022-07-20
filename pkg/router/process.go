@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"syscall"
 
@@ -14,22 +15,41 @@ import (
 
 type Process struct {
 	log        *zap.Logger
+	executable string
+	script     string
 	port       int
 	version    int
-	cmd        *exec.Cmd
+
+	pid        *int
 	cancelFunc context.CancelFunc
+}
+
+func NewProcess(log *zap.Logger, executable, script string, port, version int) *Process {
+	return &Process{
+		log:        log,
+		executable: executable,
+		script:     script,
+		port:       port,
+		version:    version,
+	}
 }
 
 func (p *Process) Run(parentCtx context.Context) error {
 	ctx, cancel := context.WithCancel(parentCtx)
 	p.cancelFunc = cancel
 
-	stdoutPipe, err := p.cmd.StdoutPipe()
+	cmd := exec.CommandContext(ctx, p.executable, p.script)
+	cmd.Env = append(os.Environ(),
+		fmt.Sprintf("PR_PORT=%d", p.port),
+		fmt.Sprintf("PR_VERSION=%d", p.version),
+	)
+
+	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("failed to pipe stdout: %w", err)
 	}
 
-	stderrPipe, err := p.cmd.StderrPipe()
+	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
 		return fmt.Errorf("failed to pipe stderr: %w", err)
 	}
@@ -80,15 +100,21 @@ func (p *Process) Run(parentCtx context.Context) error {
 	}()
 
 	p.log.Info("start proc", zap.Int("port", p.port))
-	return p.cmd.Start()
+	err = cmd.Start()
+	if err != nil {
+		return fmt.Errorf("cannot start process [%v %v]: %w", p.executable, p.script, err)
+	}
+
+	p.pid = &cmd.Process.Pid
+	return nil
 }
 
 func (p *Process) Kill() error {
-	if p.cmd.Process == nil {
+	if p.pid == nil {
 		return errors.New("cannot kill process that wasn't started")
 	}
 
-	err := syscall.Kill(p.cmd.Process.Pid, syscall.SIGINT)
+	err := syscall.Kill(*p.pid, syscall.SIGINT)
 	if err != nil {
 		return err
 	}

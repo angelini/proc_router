@@ -22,7 +22,9 @@ type VersionRequest struct {
 }
 
 func StartServer(ctx context.Context, log *zap.Logger, manager *Manager, serverPort int, script string) {
-	client := &http.Client{}
+	client := &http.Client{
+		Timeout: PROXY_REQUEST_READ_TIMEOUT,
+	}
 
 	http.HandleFunc("/__meta/version", func(resp http.ResponseWriter, req *http.Request) {
 		var versionReq VersionRequest
@@ -51,7 +53,6 @@ func StartServer(ctx context.Context, log *zap.Logger, manager *Manager, serverP
 		select {
 		case <-time.After(PROXY_REQUEST_READ_TIMEOUT):
 			http.Error(resp, "timeout waiting for live port", http.StatusGatewayTimeout)
-			log.Info("timeout waiting for live port", zap.String("url", req.URL.Path))
 
 		case port := <-portChan:
 			body, err := io.ReadAll(req.Body)
