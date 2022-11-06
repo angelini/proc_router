@@ -41,5 +41,8 @@ func main() {
 	manager := router.NewManager(ctx, log, args.host, "node", args.script, 30000)
 	defer manager.Close()
 
-	router.StartServer(ctx, log, manager, args.port, args.script)
+	err = router.StartServer(ctx, log, manager, args.port, args.script)
+	if err != nil {
+		log.Fatal("server error", zap.Error(err))
+	}
 }

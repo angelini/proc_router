@@ -114,6 +114,7 @@ func (p *Process) Kill() error {
 		return errors.New("cannot kill process that wasn't started")
 	}
 
+	// FIXME: Add a timeout & SIGTERM
 	err := syscall.Kill(*p.pid, syscall.SIGINT)
 	if err != nil {
 		return err

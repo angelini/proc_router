@@ -21,7 +21,7 @@ type VersionRequest struct {
 	Version int
 }
 
-func StartServer(ctx context.Context, log *zap.Logger, manager *Manager, serverPort int, script string) {
+func StartServer(ctx context.Context, log *zap.Logger, manager *Manager, serverPort int, script string) error {
 	client := &http.Client{
 		Timeout: PROXY_REQUEST_READ_TIMEOUT,
 	}
@@ -88,7 +88,7 @@ func StartServer(ctx context.Context, log *zap.Logger, manager *Manager, serverP
 	})
 
 	log.Info("start routing server", zap.Int("port", serverPort), zap.String("script", script))
-	http.ListenAndServe("127.0.0.1:"+strconv.Itoa(serverPort), nil)
+	return http.ListenAndServe("127.0.0.1:"+strconv.Itoa(serverPort), nil)
 }
 
 func copyHeader(dest, src http.Header) {
